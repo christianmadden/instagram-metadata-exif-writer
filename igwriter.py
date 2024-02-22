@@ -1,122 +1,151 @@
 import argparse
 import json
-import os
 from pathlib import Path
 import exiftool
 from datetime import datetime
 import os
 import time
 
+# Ensure only one instance of ExifTool is used to improve efficiency
 et = exiftool.ExifTool()
+et.start()
 
-posts_json_path = "your_instagram_activity/content/posts_1.json" # Does this number increment?
-stories_json_path = "your_instagram_activity/content/stories.json"
+# Paths to the JSON files within the Instagram archive
+posts_json_path = "your_instagram_activity/content/posts_1.json"  # Placeholder path; adapt as necessary
+stories_json_path = "your_instagram_activity/content/stories.json"  # Currently unused but included for future expansion
 
-# Process the posts and stories images from the Instagram archive
 def process_images(archive_path):
-    
-    # Ensure archive directory exists
+    """
+    Processes images from an Instagram archive by embedding metadata into the image files.
+    """
+    # Validate the archive directory
+    if not ensure_directory_exists(archive_path):
+        print(f"Error: Directory '{archive_path}' not found. Exiting...")
+        return
+
+    # Load and process posts JSON
     try:
-      ensure_directory_exists(archive_path)
-      print(f"Directory '{archive_path}' exists.")
-    except FileNotFoundError as e:
-      # Handle the case where the directory doesn't exist
-      print("Error: Directory not found. Exiting...")
-      exit(0)
+        with open(Path(archive_path) / posts_json_path, 'r') as file:
+            posts_data = json.load(file)
+    except FileNotFoundError:
+        print(f"Error: File '{posts_json_path}' not found in the archive. Exiting...")
+        return
 
-    # Load the JSON metadata
-    with open(archive_path + "/" + posts_json_path, 'r') as file:
-        data = json.load(file)
-    
-    # Loop through media elements in the JSON file
-    for item in data:
-      media = item['media'][0]
-      
-      image_path = archive_path + "/" + media['uri']
-      timestamp = exif_timestamp(item['media'][0]['creation_timestamp'])
-      file_timestamp = os_timestamp(item['media'][0]['creation_timestamp'])
-      title = sanitize(media['title'])
+    # Process each post in the JSON data
+    for item in posts_data:
+        process_media_item(item, archive_path)
 
-      # Set the file's modification and access time
-      print(image_path)
-      os.utime(image_path, (file_timestamp, file_timestamp))
+def process_media_item(item, archive_path):
+    """
+    Processes a single media item, embedding EXIF data into the corresponding image file.
+    """
+    media = item['media'][0]
+    image_path = Path(archive_path) / media['uri']
+    timestamp = exif_timestamp(media['creation_timestamp'])
+    file_timestamp = os_timestamp(media['creation_timestamp'])
+    title = sanitize(media.get('title', 'Instagram Post'))
 
-      metadata = media['media_metadata']
-      photo_metadata = metadata.get('photo_metadata')
-      video_metadata = metadata.get('video_metadata')
+    # Set the file's modification and access times
+    os.utime(image_path, (file_timestamp, file_timestamp))
 
-      exif_data = {}
-      if photo_metadata:
-        exif_data = photo_metadata['exif_data'][0]
-      if video_metadata:
-        exif_data = video_metadata['exif_data'][0]
+    # Prepare EXIF data
+    exif_data = prepare_exif_data(media, timestamp, title)
 
-      latitude, lat_ref = latitude_exif(exif_data.get('latitude'))
-      longitude, lon_ref = longitude_exif(exif_data.get('longitude'))
+    # Embed EXIF data into the image
+    add_exif_data(image_path, exif_data)
+    print(f"Processed image: {image_path}")
 
-      exif = { 
-        'EXIF:DateTimeOriginal': timestamp, 
-        'EXIF:CreateDate': timestamp, 
+def prepare_exif_data(media, timestamp, title):
+    """
+    Prepares EXIF data from media metadata.
+    """
+    metadata = media['media_metadata']
+    photo_metadata = metadata.get('photo_metadata')
+    video_metadata = metadata.get('video_metadata')
+
+    exif_data = {
+        'EXIF:DateTimeOriginal': timestamp,
+        'EXIF:CreateDate': timestamp,
         'EXIF:ImageDescription': title
-      }
-      if latitude and longitude:
-        exif['EXIF:GPSLatitude'] = latitude
-        exif['EXIF:GPSLatitudeRef'] = lat_ref
-        exif['EXIF:GPSLongitude'] = longitude
-        exif['EXIF:GPSLongitudeRef'] = lon_ref
-      else:
-        exif['EXIF:GPSLatitude'] = ''
-        exif['EXIF:GPSLatitudeRef'] = ''
-        exif['EXIF:GPSLongitude'] = ''
-        exif['EXIF:GPSLongitudeRef'] = ''
+    }
 
-      add_exif_data(image_path, exif)
+    if photo_metadata:
+        exif_data.update(photo_metadata['exif_data'][0])
+    if video_metadata:
+        exif_data.update(video_metadata['exif_data'][0])
 
-      print(f">>> { image_path }")
+    # Include GPS data if available
+    latitude, lat_ref = latitude_exif(exif_data.get('latitude'))
+    longitude, lon_ref = longitude_exif(exif_data.get('longitude'))
+    if latitude and longitude:
+        exif_data.update({
+            'EXIF:GPSLatitude': latitude,
+            'EXIF:GPSLatitudeRef': lat_ref,
+            'EXIF:GPSLongitude': longitude,
+            'EXIF:GPSLongitudeRef': lon_ref
+        })
+
+    return exif_data
 
 def add_exif_data(image_path, exif_data):
-    with exiftool.ExifTool() as et:
-      et.execute(*[f"-{tag}={value}" for tag, value in exif_data.items()], image_path)
+    """
+    Embeds EXIF data into an image file using ExifTool.
+    """
+    commands = [f"-{tag}={value}" for tag, value in exif_data.items() if value]
+    et.execute(*commands, str(image_path))
 
 def exif_timestamp(json_timestamp):
-  date_object = datetime.utcfromtimestamp(json_timestamp)
-  return date_object.strftime("%Y:%m:%d %H:%M:%S")
+    """
+    Converts a timestamp from JSON into an EXIF-compatible string format.
+    """
+    date_object = datetime.utcfromtimestamp(json_timestamp)
+    return date_object.strftime("%Y:%m:%d %H:%M:%S")
 
 def os_timestamp(json_timestamp):
-  date_object = datetime.utcfromtimestamp(json_timestamp)
-  return time.mktime(date_object.timetuple())
+    """
+    Converts a JSON timestamp into a format suitable for os.utime.
+    """
+    date_object = datetime.utcfromtimestamp(json_timestamp)
+    return time.mktime(date_object.timetuple())
 
 def latitude_exif(lat):
-  if lat is None:
-      return None, None
-  ref = 'S' if lat < 0 else 'N'
-  return abs(lat), ref
+    """
+    Formats latitude for EXIF data, including reference (N/S).
+    """
+    if lat is None:
+        return None, None
+    ref = 'S' if lat < 0 else 'N'
+    return abs(lat), ref
 
 def longitude_exif(lon):
-  if lon is None:
-      return None, None
-  ref = 'W' if lon < 0 else 'E'
-  return abs(lon), ref
+    """
+    Formats longitude for EXIF data, including reference (W/E).
+    """
+    if lon is None:
+        return None, None
+    ref = 'W' if lon < 0 else 'E'
+    return abs(lon), ref
 
 def ensure_directory_exists(directory_path):
+    """
+    Checks if the specified directory exists.
+    """
     path = Path(directory_path)
-    if not path.is_dir():
-        # If the path doesn't exist or isn't a directory, raise an error
-        raise FileNotFoundError(f"The directory '{directory_path}' does not exist.")
-    
+    return path.is_dir()
+
 def sanitize(caption, max_length=255):
-    # Replace double quotes with single quotes (or remove them)
-    sanitized = caption.replace('"', "'")
-    # Truncate to max_length to ensure it fits in EXIF limitations
-    if len(sanitized) > max_length:
-        sanitized = sanitized[:max_length]
+    """
+    Sanitizes a caption to be compatible with EXIF specifications.
+    """
+    sanitized = caption.replace('"', "'")[:max_length]
     return sanitized
 
-# Main: 
 def main():
+    """
+    Main function to parse arguments and process the Instagram archive.
+    """
     parser = argparse.ArgumentParser(description="Embed Instagram metadata as EXIF data into image files.")
-    parser.add_argument('-a', '--archive', type=str, help="Path to downloaded archive of Instagram account data from Meta.")
-
+    parser.add_argument('-a', '--archive', required=True, type=str, help="Path to downloaded archive of Instagram account data from Meta.")
     args = parser.parse_args()
 
     process_images(args.archive)
